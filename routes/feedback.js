@@ -1,146 +1,121 @@
 const express = require('express');
 const Feedback = require('../models/Feedback');
-const { protect } = require('../middleware/auth');
-const { roleCheck } = require('../middleware/roleCheck');
+const { verifyToken, authorizeRole } = require('../middleware/auth');
 
 const router = express.Router();
 
-// @desc    Create new feedback
-// @route   POST /api/feedback
-// @access  Private (USER only)
-router.post('/', protect, roleCheck('USER'), async (req, res) => {
-    try {
-        const { title, description, category } = req.body;
+const EDIT_TIME_LIMIT_MINUTES = 15;
 
-        const feedback = await Feedback.create({
-            user: req.user._id,
+// POST /api/feedback - Submit new feedback (User only)
+router.post('/', verifyToken, authorizeRole('user'), async (req, res) => {
+    try {
+        const { category, title, description } = req.body;
+
+        if (!category || !title || !description) {
+            return res.status(400).json({ message: 'Category, title, and description are required.' });
+        }
+
+        const feedback = new Feedback({
+            userId: req.user.id,
+            category,
             title,
-            description,
-            category
+            description
         });
 
-        res.status(201).json(feedback);
+        await feedback.save();
+
+        res.status(201).json({ message: 'Feedback submitted successfully.', feedback });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Server error', error: error.message });
+        console.error('Submit feedback error:', error);
+        res.status(500).json({ message: 'Server error while submitting feedback.' });
     }
 });
 
-// @desc    Get feedback (USER: own feedback, ADMIN: all feedback)
-// @route   GET /api/feedback
-// @access  Private
-router.get('/', protect, async (req, res) => {
+// GET /api/feedback - Get own feedback (User only)
+router.get('/', verifyToken, authorizeRole('user'), async (req, res) => {
     try {
-        let feedback;
-
-        if (req.user.role === 'ADMIN') {
-            // ADMIN can see all feedback
-            feedback = await Feedback.find()
-                .populate('user', 'name email')
-                .sort({ createdAt: -1 });
-        } else {
-            // USER can only see their own feedback
-            feedback = await Feedback.find({ user: req.user._id })
-                .populate('user', 'name email')
-                .sort({ createdAt: -1 });
-        }
-
-        res.json(feedback);
+        const feedbacks = await Feedback.find({ userId: req.user.id }).sort({ createdAt: -1 });
+        res.json(feedbacks);
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Server error', error: error.message });
+        console.error('Get feedback error:', error);
+        res.status(500).json({ message: 'Server error while fetching feedback.' });
     }
 });
 
-// @desc    Get single feedback by ID
-// @route   GET /api/feedback/:id
-// @access  Private
-router.get('/:id', protect, async (req, res) => {
-    try {
-        const feedback = await Feedback.findById(req.params.id).populate('user', 'name email');
-
-        if (!feedback) {
-            return res.status(404).json({ message: 'Feedback not found' });
-        }
-
-        // Check if user owns the feedback or is admin
-        if (feedback.user._id.toString() !== req.user._id.toString() && req.user.role !== 'ADMIN') {
-            return res.status(403).json({ message: 'Not authorized to view this feedback' });
-        }
-
-        res.json(feedback);
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Server error', error: error.message });
-    }
-});
-
-// @desc    Update feedback (only within 15 minutes of creation)
-// @route   PUT /api/feedback/:id
-// @access  Private (USER only, own feedback, within 15 min)
-router.put('/:id', protect, roleCheck('USER'), async (req, res) => {
+// PUT /api/feedback/:id - Edit feedback within 15 minutes (User only)
+router.put('/:id', verifyToken, authorizeRole('user'), async (req, res) => {
     try {
         const feedback = await Feedback.findById(req.params.id);
 
         if (!feedback) {
-            return res.status(404).json({ message: 'Feedback not found' });
+            return res.status(404).json({ message: 'Feedback not found.' });
         }
 
-        // Check if user owns the feedback
-        if (feedback.user.toString() !== req.user._id.toString()) {
-            return res.status(403).json({ message: 'Not authorized to update this feedback' });
+        // Check ownership
+        if (feedback.userId.toString() !== req.user.id) {
+            return res.status(403).json({ message: 'You can only edit your own feedback.' });
         }
 
-        // ⚠️ CRITICAL: Check if within 15-minute edit window
-        const timeDiffMinutes = (Date.now() - feedback.createdAt.getTime()) / 1000 / 60;
+        // Check 15-minute time limit
+        const now = new Date();
+        const createdAt = new Date(feedback.createdAt);
+        const diffInMinutes = (now - createdAt) / (1000 * 60);
 
-        if (timeDiffMinutes > 15) {
+        if (diffInMinutes > EDIT_TIME_LIMIT_MINUTES) {
             return res.status(403).json({
-                message: 'Edit window expired. Feedback can only be edited within 15 minutes of submission.',
-                editWindowExpired: true,
-                submittedAt: feedback.createdAt,
-                timeSinceSubmission: Math.floor(timeDiffMinutes)
+                message: `Edit window expired. Feedback can only be edited within ${EDIT_TIME_LIMIT_MINUTES} minutes of submission.`,
+                timeElapsed: Math.floor(diffInMinutes),
+                timeLimit: EDIT_TIME_LIMIT_MINUTES
             });
         }
 
-        // Update the feedback
-        const { title, description, category } = req.body;
+        // Update fields
+        const { category, title, description } = req.body;
+        if (category) feedback.category = category;
+        if (title) feedback.title = title;
+        if (description) feedback.description = description;
 
-        feedback.title = title || feedback.title;
-        feedback.description = description || feedback.description;
-        feedback.category = category || feedback.category;
+        await feedback.save();
 
-        const updatedFeedback = await feedback.save();
-
-        res.json(updatedFeedback);
+        res.json({ message: 'Feedback updated successfully.', feedback });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Server error', error: error.message });
+        console.error('Edit feedback error:', error);
+        res.status(500).json({ message: 'Server error while editing feedback.' });
     }
 });
 
-// @desc    Delete feedback
-// @route   DELETE /api/feedback/:id
-// @access  Private (USER only, own feedback)
-router.delete('/:id', protect, roleCheck('USER'), async (req, res) => {
+// DELETE /api/feedback/:id - Delete feedback (User only)
+router.delete('/:id', verifyToken, authorizeRole('user'), async (req, res) => {
     try {
         const feedback = await Feedback.findById(req.params.id);
 
         if (!feedback) {
-            return res.status(404).json({ message: 'Feedback not found' });
+            return res.status(404).json({ message: 'Feedback not found.' });
         }
 
-        // Check if user owns the feedback
-        if (feedback.user.toString() !== req.user._id.toString()) {
-            return res.status(403).json({ message: 'Not authorized to delete this feedback' });
+        if (feedback.userId.toString() !== req.user.id) {
+            return res.status(403).json({ message: 'You can only delete your own feedback.' });
         }
 
-        await feedback.deleteOne();
+        await Feedback.findByIdAndDelete(req.params.id);
 
-        res.json({ message: 'Feedback removed' });
+        res.json({ message: 'Feedback deleted successfully.' });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Server error', error: error.message });
+        console.error('Delete feedback error:', error);
+        res.status(500).json({ message: 'Server error while deleting feedback.' });
+    }
+});
+
+// GET /api/feedback/all - Get all feedback (Admin only)
+router.get('/all', verifyToken, authorizeRole('admin'), async (req, res) => {
+    try {
+        const feedbacks = await Feedback.find()
+            .populate('userId', 'name email')
+            .sort({ createdAt: -1 });
+        res.json(feedbacks);
+    } catch (error) {
+        console.error('Get all feedback error:', error);
+        res.status(500).json({ message: 'Server error while fetching all feedback.' });
     }
 });
 
